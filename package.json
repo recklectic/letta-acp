@@ -1,0 +1,23 @@
+{
+  "name": "letta-acp",
+  "version": "0.1.0",
+  "description": "ACP (Agent Client Protocol) adapter bridging ACP clients to Letta agents over stdio",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node test/test-client.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.2.0",
+    "@letta-ai/letta-client": "^1.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^5.9.3"
+  }
+}
