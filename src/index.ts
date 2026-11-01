@@ -27,6 +27,7 @@
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { Letta } from "@letta-ai/letta-client";
+import { T3Mcp } from "./t3-mcp.js";
 
 const { LETTA_API_KEY, LETTA_AGENT_ID, LETTA_BASE_URL } = process.env;
 
@@ -44,6 +45,7 @@ const letta = new Letta({
 
 /** Per-session cancel flag, keyed by ACP session id (= conversation id). */
 const cancelled = new Map<string, boolean>();
+const sessionMcp = new Map<string, T3Mcp>();
 
 function log(msg: string): void {
   process.stderr.write(`letta-acp: ${msg}\n`);
@@ -64,6 +66,12 @@ function textFromContent(content: unknown): string {
   return "";
 }
 
+function eventCalls(event: any): any[] {
+  if (Array.isArray(event.tool_calls)) return event.tool_calls;
+  if (Array.isArray(event.tool_calls?.tool_calls)) return event.tool_calls.tool_calls;
+  return event.tool_call ? [event.tool_call] : [];
+}
+
 const app = acp.agent({ name: "letta-acp" });
 
 app.onRequest(acp.methods.agent.initialize, async () => ({
@@ -71,7 +79,7 @@ app.onRequest(acp.methods.agent.initialize, async () => ({
   agentCapabilities: {
     loadSession: false,
     promptCapabilities: { image: false, audio: false, embeddedContext: false },
-    mcpCapabilities: { http: false, sse: false },
+    mcpCapabilities: { http: true, sse: false },
   },
   authMethods: [],
   agentInfo: {
@@ -82,12 +90,17 @@ app.onRequest(acp.methods.agent.initialize, async () => ({
 }));
 
 app.onRequest(acp.methods.agent.session.new, async ({ params }) => {
+  const server = params.mcpServers.find((s) => "type" in s && s.type === "http" && s.name === "t3-code");
+  const mcp = server && "type" in server && server.type === "http" ? await T3Mcp.connect(server) : undefined;
+  try {
   const conv = await letta.conversations.create({
     agent_id: LETTA_AGENT_ID as string,
   });
   cancelled.set(conv.id, false);
+  if (mcp) sessionMcp.set(conv.id, mcp);
   log(`session/new -> conversation ${conv.id}`);
   return { sessionId: conv.id };
+  } catch (error) { await mcp?.close(); throw error; }
 });
 
 app.onRequest(acp.methods.agent.session.prompt, async (ctx) => {
@@ -111,9 +124,13 @@ app.onRequest(acp.methods.agent.session.prompt, async (ctx) => {
   let stopReason: acp.StopReason = "end_turn";
 
   try {
+    const mcp = sessionMcp.get(sessionId);
+    let messages: any[] = [{ role: "user", content: [{ type: "text", text }] }];
+    while (true) {
+    const approvals: any[] = [];
+    let letTaStop: string | undefined;
     const stream = await letta.conversations.messages.create(sessionId, {
-      messages: [{ role: "user", content: [{ type: "text", text }] }],
-      streaming: true,
+      messages, streaming: true, ...(mcp ? { client_tools: mcp.tools } : {}),
     });
 
     for await (const event of stream) {
@@ -123,6 +140,10 @@ app.onRequest(acp.methods.agent.session.prompt, async (ctx) => {
       }
       const mt = (event as any)?.message_type;
       switch (mt) {
+        case "approval_request_message": {
+          approvals.push(...eventCalls(event));
+          break;
+        }
         case "assistant_message": {
           const t = textFromContent((event as any).content);
           if (t) {
@@ -205,6 +226,7 @@ app.onRequest(acp.methods.agent.session.prompt, async (ctx) => {
         }
         case "stop_reason": {
           const r = (event as any).stop_reason ?? (event as any).stopReason;
+          letTaStop = r;
           if (r === "max_tokens" || r === "max_turn_requests") {
             stopReason = r;
           }
@@ -214,6 +236,21 @@ app.onRequest(acp.methods.agent.session.prompt, async (ctx) => {
           // ping / usage_statistics / system / user / hidden_* — not mapped
           break;
       }
+    }
+    if (cancelled.get(sessionId) || ctx.signal.aborted) { stopReason = "cancelled"; break; }
+    if (letTaStop !== "requires_approval") break;
+    if (!mcp || !approvals.length || approvals.some(c => !mcp.has(c.name))) {
+      throw new Error("Letta requested approval for an unsupported tool; no tool was executed.");
+    }
+    const returns = [];
+    for (const c of approvals) {
+      let args: unknown = c.arguments ?? {};
+      if (typeof args === "string") args = JSON.parse(args);
+      if (!args || typeof args !== "object" || Array.isArray(args) || !c.tool_call_id) throw new Error("Invalid client tool call");
+      const result = await mcp.call(c.name, args as Record<string, unknown>);
+      returns.push({ type: "tool", tool_call_id: c.tool_call_id, ...result });
+    }
+    messages = [{ type: "tool_return", tool_returns: returns }];
     }
     return { stopReason };
   } catch (err: any) {

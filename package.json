@@ -14,7 +14,8 @@
   "license": "ISC",
   "dependencies": {
     "@agentclientprotocol/sdk": "^2.2.0",
-    "@letta-ai/letta-client": "^1.12.1"
+    "@letta-ai/letta-client": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.32.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
