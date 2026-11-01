@@ -71,17 +71,51 @@ Stream events → `session/update` notifications:
 The Letta agent runs its **own** tools server-side — the adapter does no
 filesystem or terminal proxying, and advertises no MCP capabilities.
 
-## Test client
+## Tests
 
-`test/test-client.mjs` speaks raw JSON-RPC over the adapter's stdio — no SDK,
-bytes on the wire — so it doubles as a spec-compliance check:
+```bash
+npm test
+```
+
+Builds the adapter and runs an ACP SDK client against its real stdio subprocess,
+with a loopback-only mock Letta HTTP/SSE server. No credentials or inference are
+needed. Tests cover initialization/session creation, v1 negotiation after a v2
+version offer, text/thought/tool/result/final-text ordering, empty failed tool
+results, token limits, HTTP errors, and bounded failure on a stalled request.
+These are synthetic fixtures, not a reproduction of T3's exact traffic.
+
+The shared test client records wire order, reports update types immediately,
+and closes the adapter on request timeout. The SDK decodes inbound notifications;
+explicit assertions check responses and expected content. This is regression
+coverage, not a claim of complete ACP conformance or T3 compatibility.
+
+### Live session-only probe (opt-in)
+
+With `LETTA_API_KEY` and `LETTA_AGENT_ID` set:
+
+```bash
+npm run test:session
+```
+
+Runs only `initialize` and `session/new`, with a 15-second deadline per request.
+It creates one real empty conversation and prints its ID; it does **not** send a
+prompt or request inference. It uses the invoking shell's environment, not T3's
+saved provider credentials. It leaves the empty conversation in place.
+
+### Raw live prompt client (opt-in)
+
+`test/test-client.mjs` speaks raw JSON-RPC over the adapter's stdio without SDK
+schema checks. It is a diagnostic smoke client, not a spec-compliance validator:
 
 ```bash
 LETTA_API_KEY=… LETTA_AGENT_ID=agent-… node test/test-client.mjs "hello"
 ```
 
-It runs `initialize → session/new → session/prompt`, prints every
-`session/update` as it arrives, then the final `stopReason` and transcript.
+It runs `initialize → session/new → session/prompt`, prints assistant text as it
+arrives, then the final `stopReason` and buffered thought/tool transcript. Unlike
+the SDK test client, this original smoke client has no timeout. It invokes the
+configured live agent and consumes inference quota. `npm run test:live -- "hello"`
+is an equivalent entry point.
 
 ## Known gaps (v0)
 
@@ -104,4 +138,7 @@ It runs `initialize → session/new → session/prompt`, prints every
 src/index.ts          adapter (authoritative source)
 dist/index.js         compiled output (committed for zero-build wiring)
 test/test-client.mjs  raw JSON-RPC test client
+test/sdk-client.mjs   bounded SDK subprocess client shared by tests/probe
+test/protocol.test.mjs offline HTTP/SSE fixture regression tests
+test/session-probe.mjs opt-in live session creation, no inference
 ```
