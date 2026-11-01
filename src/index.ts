@@ -1,32 +1,46 @@
 #!/usr/bin/env node
 /**
- * letta-acp — ACP (Agent Client Protocol) adapter for Letta agents.
+ * letta-acp v1 — ACP (Agent Client Protocol) adapter for Letta agents.
  *
- * Bridges ACP clients (Zed, T3 Code, ...) over stdio JSON-RPC to a Letta
- * Cloud agent via the official Letta client.
+ * CLI-backed: each ACP prompt runs the Letta Code CLI headless
+ * (`letta -p --output-format stream-json`) one-shot against the session's
+ * conversation. The CLI is the harness — tools, memory, skills, persona all
+ * run exactly as they do interactively. The adapter translates the CLI's
+ * final result into ACP session updates.
+ *
+ * Wire shape (deliberate, per the v1 design record):
+ *   - No mid-turn streaming: T3 shows its spinner, then the turn lands as
+ *     one agent_message_chunk. The CLI cannot stream partial output to an
+ *     ACP client without --input-format stream-json, which is rejected for
+ *     Cloud agents.
+ *   - No permission events: headless runs auto-execute tool calls.
+ *
+ * Orchestration (T3 MCP servers): the ACP session's mcpServers entry is
+ * injected into the CLI process env as T3_MCP_URL / T3_MCP_BEARER_TOKEN
+ * (the Pi pattern — env is session-scoped, no token file on disk), and a
+ * one-shot helper script (t3.mjs) is dropped into the session workspace so
+ * the agent can call orchestrator tools from its shell in one command.
  *
  * Configuration (environment):
- *   LETTA_API_KEY    required  Letta API token
- *   LETTA_AGENT_ID   required  agent to attach (e.g. agent-xxxx)
- *   LETTA_BASE_URL   optional  default https://api.letta.com
- *
- * Protocol mapping (ACP v1 stable):
- *   initialize      -> static agent info, no auth methods, no loadSession
- *   session/new     -> POST /v1/conversations (new conversation; the
- *                      conversation id IS the ACP session id)
- *   session/prompt  -> POST /v1/conversations/{id}/messages (streaming SSE),
- *                      events forwarded as session/update notifications:
- *                        assistant_message -> agent_message_chunk
- *                        reasoning_message -> agent_thought_chunk
- *                        tool_call_message -> tool_call
- *                        tool_return_message -> tool_call_update
- *   session/cancel  -> POST /v1/conversations/{id}/cancel + local flag
+ *   LETTA_API_KEY        required  Letta API token
+ *   LETTA_AGENT_ID       required  agent to attach
+ *   LETTA_BASE_URL       optional  default https://api.letta.com
+ *   LETTA_ACP_CLI        optional  override: path to the CLI's JS entry
+ *   LETTA_ACP_CWD        optional  fallback cwd when a session has none
+ *   LETTA_ACP_TIMEOUT_MS optional  session API call bound (default 30000)
  *
  * stdout is the protocol. All logging goes to stderr.
  */
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Readable, Writable } from "node:stream";
-import * as acp from "@agentclientprotocol/sdk";
+// Full v1 (stable + unstable): mcpServers on session params is unstable
+// surface, and stable request parsing may strip it.
+import * as acp from "@agentclientprotocol/sdk/unstable";
 import { Letta } from "@letta-ai/letta-client";
+import { HELPER_SCRIPT } from "./helper.js";
+import { resolveCli } from "./cli.js";
 
 const { LETTA_API_KEY, LETTA_AGENT_ID, LETTA_BASE_URL } = process.env;
 
@@ -42,26 +56,87 @@ const letta = new Letta({
   ...(LETTA_BASE_URL ? { baseURL: LETTA_BASE_URL } : {}),
 });
 
-/** Per-session cancel flag, keyed by ACP session id (= conversation id). */
-const cancelled = new Map<string, boolean>();
+const MODES = [{ id: "default", name: "Default" }];
+const MODE_STATE = { currentModeId: "default", availableModes: MODES };
+
+interface SessionState {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  child: ChildProcess | null;
+  cancelled: boolean;
+}
+
+/** ACP session id == Letta conversation id. */
+const sessions = new Map<string, SessionState>();
 
 function log(msg: string): void {
   process.stderr.write(`letta-acp: ${msg}\n`);
 }
 
-/** Extract text from Letta message content (string or content-block array). */
-function textFromContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((c) =>
-        c && typeof c === "object" && (c as any).type === "text"
-          ? String((c as any).text ?? "")
-          : ""
-      )
-      .join("");
+function sessionTimeoutMs(): number {
+  const n = Number(process.env.LETTA_ACP_TIMEOUT_MS);
+  return n > 0 ? n : 30_000;
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+/** The T3 orchestrator endpoint + bearer, from the session's mcpServers. */
+function pickMcpServer(servers: unknown): { url: string; token: string } | null {
+  if (!Array.isArray(servers)) return null;
+  const http = servers.filter(
+    (s): s is Record<string, unknown> =>
+      !!s && typeof s === "object" && (s as Record<string, unknown>).type === "http"
+  );
+  if (!http.length) return null;
+  const named = http.find((s) => s.name === "t3-code");
+  const chosen = named ?? (http.length === 1 ? http[0] : undefined);
+  if (!chosen) {
+    log(
+      `multiple http MCP servers (${http.map((s) => s.name).join(", ")}), none named t3-code — not injecting`
+    );
+    return null;
   }
-  return "";
+  const headers = Array.isArray(chosen.headers)
+    ? (chosen.headers as Array<Record<string, unknown>>)
+    : [];
+  const auth = headers.find((h) => String(h.name).toLowerCase() === "authorization");
+  if (typeof chosen.url !== "string" || !auth || typeof auth.value !== "string") {
+    log(`MCP server ${chosen.name} lacks url or Authorization header — not injecting`);
+    return null;
+  }
+  return { url: chosen.url, token: auth.value.replace(/^Bearer\s+/i, "") };
+}
+
+function buildEnv(mcp: { url: string; token: string } | null): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...(mcp ? { T3_MCP_URL: mcp.url, T3_MCP_BEARER_TOKEN: mcp.token } : {}),
+  };
+}
+
+function dropHelper(cwd: string, mcp: { url: string; token: string } | null): void {
+  if (!mcp) return;
+  try {
+    fs.writeFileSync(path.join(cwd, "t3.mjs"), HELPER_SCRIPT);
+    log("helper script dropped: t3.mjs");
+  } catch (err: any) {
+    log(`could not drop helper script (continuing): ${err?.message ?? err}`);
+  }
+}
+
+function killTree(child: ChildProcess): void {
+  if (process.platform === "win32" && child.pid) {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"]);
+  } else {
+    child.kill("SIGTERM");
+  }
 }
 
 const app = acp.agent({ name: "letta-acp" });
@@ -69,175 +144,229 @@ const app = acp.agent({ name: "letta-acp" });
 app.onRequest(acp.methods.agent.initialize, async () => ({
   protocolVersion: acp.PROTOCOL_VERSION,
   agentCapabilities: {
-    loadSession: false,
+    loadSession: true,
     promptCapabilities: { image: false, audio: false, embeddedContext: false },
-    mcpCapabilities: { http: false, sse: false },
+    mcpCapabilities: { http: true, sse: false },
   },
   authMethods: [],
   agentInfo: {
     name: "letta-acp",
-    title: "Letta ACP adapter",
-    version: "0.1.0",
+    title: "Ada — Letta agent",
+    version: "1.0.0",
   },
 }));
 
+function sessionCwd(cwd: string | undefined): string {
+  return cwd || process.env.LETTA_ACP_CWD || process.cwd();
+}
+
 app.onRequest(acp.methods.agent.session.new, async ({ params }) => {
-  const conv = await letta.conversations.create({
-    agent_id: LETTA_AGENT_ID as string,
-  });
-  cancelled.set(conv.id, false);
-  log(`session/new -> conversation ${conv.id}`);
-  return { sessionId: conv.id };
+  const mcp = pickMcpServer((params as Record<string, unknown>).mcpServers);
+  const conv = await withTimeout(
+    letta.conversations.create({ agent_id: LETTA_AGENT_ID as string }),
+    sessionTimeoutMs(),
+    "session/new"
+  );
+  const cwd = sessionCwd(params.cwd);
+  sessions.set(conv.id, { cwd, env: buildEnv(mcp), child: null, cancelled: false });
+  dropHelper(cwd, mcp);
+  log(`session/new -> conversation ${conv.id} (cwd ${cwd})`);
+  return { sessionId: conv.id, modes: MODE_STATE };
+});
+
+app.onRequest(acp.methods.agent.session.load, async ({ params }) => {
+  await withTimeout(
+    letta.conversations.retrieve(params.sessionId),
+    sessionTimeoutMs(),
+    "session/load"
+  );
+  const mcp = pickMcpServer((params as Record<string, unknown>).mcpServers);
+  const cwd = sessionCwd(params.cwd);
+  sessions.set(params.sessionId, { cwd, env: buildEnv(mcp), child: null, cancelled: false });
+  dropHelper(cwd, mcp);
+  log(`session/load -> conversation ${params.sessionId} (cwd ${cwd})`);
+  return { modes: MODE_STATE };
+});
+
+app.onRequest(acp.methods.agent.session.setMode, async ({ params }) => {
+  if (params.modeId !== "default") throw new Error(`unknown mode: ${params.modeId}`);
+  return {};
 });
 
 app.onRequest(acp.methods.agent.session.prompt, async (ctx) => {
-  const sessionId = ctx.params.sessionId;
-  cancelled.set(sessionId, false);
+  const { sessionId } = ctx.params;
+  const state = sessions.get(sessionId);
+  if (!state) throw new Error("unknown session — call session/new or session/load first");
+  if (state.child && state.child.exitCode === null) {
+    throw new Error("a prompt is already in flight on this session");
+  }
 
-  const text = ctx.params.prompt
+  const blocks = ctx.params.prompt;
+  if (!blocks.every((b) => b.type === "text")) {
+    log("prompt contained non-text blocks (not advertised); they were dropped");
+  }
+  const text = blocks
     .filter((b) => b.type === "text")
-    .map((b) => (b as acp.TextContent).text)
+    .map((b) => (b as { text: string }).text)
     .join("\n");
 
-  const update = (u: acp.SessionUpdate) =>
-    ctx.client.notify(acp.methods.client.session.update, {
-      sessionId,
-      update: u,
-    });
-
-  /** toolCallId -> name, for pairing tool_call_update to its tool_call. */
-  const toolCalls = new Map<string, string>();
-
-  let stopReason: acp.StopReason = "end_turn";
-
-  try {
-    const stream = await letta.conversations.messages.create(sessionId, {
-      messages: [{ role: "user", content: [{ type: "text", text }] }],
-      streaming: true,
-    });
-
-    for await (const event of stream) {
-      if (cancelled.get(sessionId) || ctx.signal.aborted) {
-        stopReason = "cancelled";
-        break;
-      }
-      const mt = (event as any)?.message_type;
-      switch (mt) {
-        case "assistant_message": {
-          const t = textFromContent((event as any).content);
-          if (t) {
-            await update({
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: t },
-            });
-          }
-          break;
-        }
-        case "reasoning_message": {
-          const t = (event as any).reasoning ?? "";
-          if (t) {
-            await update({
-              sessionUpdate: "agent_thought_chunk",
-              content: { type: "text", text: t },
-            });
-          }
-          break;
-        }
-        case "tool_call_message": {
-          const e = event as any;
-          const calls: any[] = e.tool_call
-            ? [e.tool_call]
-            : Array.isArray(e.tool_calls)
-              ? e.tool_calls
-              : Array.isArray(e.tool_calls?.tool_calls)
-                ? e.tool_calls.tool_calls
-                : [];
-          for (const c of calls) {
-            const id: string = c.tool_call_id ?? c.id ?? `tc-${Date.now()}`;
-            const name: string = c.name ?? "tool";
-            toolCalls.set(id, name);
-            let rawInput: unknown = c.arguments;
-            if (typeof rawInput === "string") {
-              try {
-                rawInput = JSON.parse(rawInput);
-              } catch {
-                /* keep raw string */
-              }
-            }
-            await update({
-              sessionUpdate: "tool_call",
-              toolCallId: id,
-              title: name,
-              name,
-              kind: "other",
-              status: "in_progress",
-              rawInput,
-            });
-          }
-          break;
-        }
-        case "tool_return_message": {
-          const e = event as any;
-          const id: string =
-            e.tool_call_id ?? [...toolCalls.keys()].pop() ?? "unknown";
-          const ok = e.status !== "error";
-          const out =
-            typeof e.tool_return === "string"
-              ? e.tool_return
-              : e.tool_return != null
-                ? JSON.stringify(e.tool_return)
-                : "";
-          await update({
-            sessionUpdate: "tool_call_update",
-            toolCallId: id,
-            status: ok ? "completed" : "failed",
-            content: out
-              ? [
-                  {
-                    type: "content",
-                    content: { type: "text", text: out.slice(0, 4000) },
-                  },
-                ]
-              : null,
-            rawOutput: e.tool_return,
-          });
-          break;
-        }
-        case "stop_reason": {
-          const r = (event as any).stop_reason ?? (event as any).stopReason;
-          if (r === "max_tokens" || r === "max_turn_requests") {
-            stopReason = r;
-          }
-          break;
-        }
-        default:
-          // ping / usage_statistics / system / user / hidden_* — not mapped
-          break;
-      }
-    }
-    return { stopReason };
-  } catch (err: any) {
-    if (cancelled.get(sessionId)) return { stopReason: "cancelled" };
-    // Surface the failure in-stream, then fail the request so the client
-    // sees a JSON-RPC error rather than a silent hang.
-    await update({
-      sessionUpdate: "agent_message_chunk",
-      content: {
-        type: "text",
-        text: `\n[letta-acp error: ${err?.message ?? String(err)}]`,
-      },
-    }).catch(() => {});
-    throw err;
+  const cli = resolveCli();
+  if (!cli) {
+    throw new Error("could not resolve the letta CLI on PATH — set LETTA_ACP_CLI to its JS entry");
   }
+
+  state.cancelled = false;
+  const child = spawn(
+    cli.command,
+    [
+      ...cli.args,
+      "-p",
+      "--agent",
+      LETTA_AGENT_ID as string,
+      "--conversation",
+      sessionId,
+      "--output-format",
+      "stream-json",
+      text,
+    ],
+    { cwd: state.cwd, env: state.env, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  state.child = child;
+  log(`spawned CLI (pid ${child.pid}) for ${sessionId}`);
+
+  const update = (u: acp.SessionUpdate) =>
+    ctx.client.notify(acp.methods.client.session.update, { sessionId, update: u });
+
+  return await new Promise<{ stopReason: acp.StopReason }>((resolve, reject) => {
+    let settled = false;
+    let sawResult = false;
+
+    const finish = (stopReason: acp.StopReason) => {
+      if (settled) return;
+      settled = true;
+      state.child = null;
+      resolve({ stopReason });
+    };
+
+    /**
+     * Visible diagnostic chunk, then a JSON-RPC error. ACP v1's StopReason
+     * enum has no "error" value — rejecting the request is the protocol's
+     * failure channel; the chunk keeps the failure readable in the thread.
+     */
+    const errorFinish = (message: string) => {
+      if (settled) return;
+      settled = true;
+      state.child = null;
+      update({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `[letta-acp error: ${message}]` },
+      })
+        .catch(() => {})
+        .then(() => reject(new Error(message)));
+    };
+
+    const handleResult = (obj: Record<string, unknown>) => {
+      sawResult = true;
+      if (obj.subtype === "error") {
+        const err = obj.error;
+        const message =
+          typeof err === "string"
+            ? err
+            : err && typeof err === "object" && typeof (err as Record<string, unknown>).message === "string"
+              ? ((err as Record<string, unknown>).message as string)
+              : JSON.stringify(obj).slice(0, 300);
+        errorFinish(`CLI turn failed: ${message}`);
+        return;
+      }
+      const raw = obj.stop_reason;
+      const stopReason: acp.StopReason =
+        raw === "max_tokens" || raw === "max_turn_requests"
+          ? raw
+          : raw === "refused"
+            ? "refusal"
+            : "end_turn";
+      const resultText = typeof obj.result === "string" ? obj.result : "";
+      if (resultText) {
+        update({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: resultText },
+        })
+          .catch(() => {})
+          .then(() => finish(stopReason));
+      } else {
+        finish(stopReason);
+      }
+    };
+
+    let buffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      buffer += chunk;
+      let idx: number;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        let obj: Record<string, unknown>;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          log(`unparseable CLI stdout line: ${line.slice(0, 120)}`);
+          continue;
+        }
+        if (typeof obj.type !== "string") continue; // receipt / untyped noise
+        if (obj.type === "init") {
+          const bound = obj.conversation_id;
+          if (typeof bound === "string" && bound !== sessionId) {
+            log(`CLI bound a DIFFERENT conversation (${bound}) — aborting`);
+            killTree(child);
+            errorFinish(`CLI bound conversation ${bound}, expected ${sessionId}`);
+          }
+        } else if (obj.type === "result") {
+          handleResult(obj);
+        }
+        // Other typed events are mid-turn noise on this wire — not forwarded.
+      }
+    });
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      for (const line of chunk.split(/\r?\n/)) if (line.trim()) log(`[cli] ${line}`);
+    });
+
+    child.on("error", (err) => {
+      if (!sawResult) errorFinish(`CLI failed to start: ${err.message}`);
+    });
+
+    child.on("close", (code) => {
+      if (sawResult || settled) return;
+      if (state.cancelled) {
+        finish("cancelled");
+        return;
+      }
+      errorFinish(`CLI exited (code ${code}) without a result event`);
+    });
+
+    ctx.signal.addEventListener("abort", () => {
+      if (settled) return;
+      state.cancelled = true;
+      killTree(child);
+    });
+  });
 });
 
 app.onNotification(acp.methods.agent.session.cancel, async ({ params }) => {
-  cancelled.set(params.sessionId, true);
-  log(`session/cancel ${params.sessionId}`);
-  try {
-    await letta.conversations.cancel(params.sessionId);
-  } catch (err: any) {
-    log(`cancel call failed (continuing locally): ${err?.message ?? err}`);
+  const state = sessions.get(params.sessionId);
+  if (!state) {
+    log(`session/cancel for unknown session ${params.sessionId}`);
+    return;
+  }
+  state.cancelled = true;
+  if (state.child && state.child.exitCode === null) {
+    log(`session/cancel ${params.sessionId} — killing CLI pid ${state.child.pid}`);
+    killTree(state.child);
+  } else {
+    log(`session/cancel ${params.sessionId} — no turn in flight`);
   }
 });
 
@@ -247,4 +376,4 @@ const stream = acp.ndJsonStream(
   Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>
 );
 app.connect(stream);
-log("connected on stdio (ACP v1 stable)");
+log("connected on stdio (ACP v1, CLI-backed)");
